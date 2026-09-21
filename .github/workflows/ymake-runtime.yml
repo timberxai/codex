@@ -1,0 +1,114 @@
+# Publish the two executables YMake's native Harness needs, built from one exact commit,
+# so a deployment can download them instead of compiling Codex on the target machine.
+#
+# Trigger with a tag `ymake-<full commit sha>` or by hand with the commit. The release
+# carries `codex`, `codex-code-mode-host` and `codex-source-build.json`; the record is what
+# YMake's `verify_build` checks (kind, status, sourceCommit, per-file sha256). The build
+# command mirrors YMake's `scripts/build/build_codex_source.py` (release profile, no bwrap
+# digest embedding), so a downloaded pair behaves like a locally built one.
+name: ymake-runtime
+
+on:
+  push:
+    tags:
+      - "ymake-*"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full commit sha to build and publish as release ymake-<sha>
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Resolve commit
+        id: ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            sha="${{ github.event.inputs.commit }}"
+          else
+            sha="${GITHUB_REF_NAME#ymake-}"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full 40-hex commit sha, got '$sha'" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.sha }}
+      - name: Confirm checkout is the requested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${{ steps.ref.outputs.sha }}" ]]
+          [[ -z "$(git status --porcelain)" ]]
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils pkg-config libcap-dev libssl-dev cmake
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+      - name: Cargo build (same command as YMake's source build)
+        shell: bash
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          cargo build --locked --profile release --jobs 4 --target-dir target \
+            -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+          test -x target/release/codex && test -x target/release/codex-code-mode-host
+      - name: Write source-build record and stage assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp codex-rs/target/release/codex dist/codex
+          cp codex-rs/target/release/codex-code-mode-host dist/codex-code-mode-host
+          chmod 755 dist/codex dist/codex-code-mode-host
+          python3 - "${{ steps.ref.outputs.sha }}" <<'PY'
+          import hashlib, json, sys, datetime, pathlib
+          sha = sys.argv[1]
+          files = {name: hashlib.sha256(pathlib.Path('dist', name).read_bytes()).hexdigest()
+                   for name in ('codex', 'codex-code-mode-host')}
+          record = {
+              'kind': 'ymake-codex-source-build', 'status': 'built', 'sourceCommit': sha,
+              'profile': 'release', 'target': 'x86_64-unknown-linux-gnu',
+              'builder': 'github-actions timberxai/codex ymake-runtime',
+              'command': ['cargo', 'build', '--locked', '--profile', 'release', '-p', 'codex-cli', '--bin', 'codex',
+                          '-p', 'codex-code-mode-host', '--bin', 'codex-code-mode-host'],
+              'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'files': files,
+          }
+          pathlib.Path('dist/codex-source-build.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          PY
+          (cd dist && sha256sum codex codex-code-mode-host codex-source-build.json > SHA256SUMS)
+      - name: Publish release ymake-<sha>
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="ymake-${{ steps.ref.outputs.sha }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/codex dist/codex-code-mode-host dist/codex-source-build.json dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" --target "${{ steps.ref.outputs.sha }}" --title "YMake runtime ${{ steps.ref.outputs.sha }}" \
+              --notes "codex + codex-code-mode-host built from ${{ steps.ref.outputs.sha }} (release profile, x86_64-unknown-linux-gnu). Downloaded by YMake deployments pinned to this commit; verified by sha256 in codex-source-build.json." \
+              dist/codex dist/codex-code-mode-host dist/codex-source-build.json dist/SHA256SUMS
+          fi
