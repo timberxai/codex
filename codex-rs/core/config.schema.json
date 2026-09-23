@@ -7076,6 +7076,10 @@
       },
       "type": "object"
     },
+    "prompt_cache_key": {
+      "description": "Prompt cache key sent with this session's model requests. Threads that begin with the same instructions and tools can share one key, so a new thread reuses the provider's cached prefix instead of paying for it again. Unset, each thread uses its own id.",
+      "type": "string"
+    },
     "realtime": {
       "allOf": [
         {

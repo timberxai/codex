@@ -1670,6 +1670,7 @@ impl Session {
                         &session_configuration.session_source,
                         session_configuration.parent_thread_id,
                     )
+                    .or_else(|| config.prompt_cache_key.clone())
                     .or(fork_cache_key),
                     tx_event.clone(),
                 ),
